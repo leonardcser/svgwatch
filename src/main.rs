@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -161,14 +161,25 @@ impl App {
 
     fn start_watcher(&mut self) {
         let proxy = self.proxy.clone();
+        let watch_file = self.svg_path.clone();
+        let watch_name = self.svg_path.file_name().map(|n| n.to_os_string());
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                if matches!(
-                    ev.kind,
-                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                ) {
-                    let _ = proxy.send_event(AppEvent::FileChanged);
-                }
+            let Ok(ev) = res else { return };
+            if !matches!(
+                ev.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+            ) {
+                return;
+            }
+            // Watching the parent dir surfaces events for unrelated siblings
+            // (editor swap files, etc.); only react to our SVG.
+            let touches_target = ev.paths.iter().any(|p| {
+                p == &watch_file
+                    || p.canonicalize().ok().as_deref() == Some(watch_file.as_path())
+                    || (watch_name.is_some() && p.file_name() == watch_name.as_deref())
+            });
+            if touches_target {
+                let _ = proxy.send_event(AppEvent::FileChanged);
             }
         });
         if let Ok(mut w) = watcher {
@@ -176,10 +187,13 @@ impl App {
             let target = self
                 .svg_path
                 .parent()
-                .map(|p| p.to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            if w.watch(&target, RecursiveMode::NonRecursive).is_ok() {
-                self._watcher = Some(w);
+            match w.watch(&target, RecursiveMode::NonRecursive) {
+                Ok(()) => self._watcher = Some(w),
+                Err(err) => log::warn!("file watcher failed on {}: {err}", target.display()),
             }
         }
     }
@@ -198,9 +212,9 @@ impl App {
 
         self.text_index.clear();
         Self::collect_text(tree.root(), &mut self.text_index);
-        if self.search_active {
-            self.recompute_matches();
-        }
+        // Always rebuild matches so a non-empty query reflects the new file
+        // even if the search bar is currently closed.
+        self.recompute_matches();
         Ok(())
     }
 
@@ -951,6 +965,11 @@ fn main() -> Result<()> {
     if !path.exists() {
         anyhow::bail!("SVG file not found: {}", path.display());
     }
+    // Canonicalize so `parent()` is always a real directory and watcher
+    // event paths can be compared by equality.
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
