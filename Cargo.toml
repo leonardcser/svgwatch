@@ -15,7 +15,12 @@ env_logger = "0.11"
 egui = "0.33"
 egui-wgpu = "0.33"
 egui-winit = { version = "0.33", default-features = false, features = ["clipboard", "links"] }
+dhat = { version = "0.3.3", optional = true }
+libc = { version = "0.2.186", optional = true }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[features]
+dhat = ["dep:dhat", "dep:libc"]

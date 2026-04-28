@@ -17,6 +17,33 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::Window;
 
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "dhat")]
+fn mem_log(label: &str) {
+    let bytes = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return;
+        }
+        // macOS reports ru_maxrss in bytes; Linux reports kilobytes.
+        if cfg!(target_os = "macos") {
+            ru.ru_maxrss as f64
+        } else {
+            ru.ru_maxrss as f64 * 1024.0
+        }
+    };
+    eprintln!(
+        "mem [{label}]: rss_peak={:.1} MiB",
+        bytes / (1024.0 * 1024.0)
+    );
+}
+
+#[cfg(not(feature = "dhat"))]
+fn mem_log(_label: &str) {}
+
 const ZOOM_PER_LINE: f64 = 1.15;
 const ZOOM_PER_PIXEL: f64 = 0.0015;
 const PAN_STEP: f64 = 40.0;
@@ -114,6 +141,7 @@ fn install_system_font(ctx: &egui::Context, db: &usvg::fontdb::Database) {
 
 impl App {
     fn new(svg_path: PathBuf, proxy: EventLoopProxy<AppEvent>) -> Result<Self> {
+        mem_log("App::new entry");
         // Loading system fonts is the slowest startup step (~hundreds of ms
         // on macOS); do it once and share the Arc across reloads.
         let t0 = Instant::now();
@@ -124,9 +152,11 @@ impl App {
             db.len(),
             t0.elapsed()
         );
+        mem_log("after load_system_fonts");
 
         let egui_ctx = egui::Context::default();
         install_system_font(&egui_ctx, &db);
+        mem_log("after egui ctx + system font");
 
         let mut app = Self {
             context: RenderContext::new(),
@@ -155,6 +185,7 @@ impl App {
             _watcher: None,
         };
         app.load_svg().context("loading initial SVG")?;
+        mem_log("after initial load_svg");
         app.start_watcher();
         Ok(app)
     }
@@ -535,17 +566,20 @@ impl ApplicationHandler<AppEvent> for App {
         self.renderers
             .resize_with(self.context.devices.len(), || None);
         self.renderers[surface.dev_id].get_or_insert_with(|| {
+            // Only `AaConfig::Area` is used at render time; compiling MSAA8 and
+            // MSAA16 pipelines wastes ~hundreds of MB of GPU memory.
             Renderer::new(
                 &self.context.devices[surface.dev_id].device,
                 RendererOptions {
                     use_cpu: false,
-                    antialiasing_support: vello::AaSupport::all(),
+                    antialiasing_support: vello::AaSupport::area_only(),
                     num_init_threads: std::num::NonZeroUsize::new(1),
                     pipeline_cache: None,
                 },
             )
             .expect("create renderer")
         });
+        mem_log("after Renderer::new");
 
         self.fit(size.width, size.height);
 
@@ -577,6 +611,7 @@ impl ApplicationHandler<AppEvent> for App {
             surface: Box::new(surface),
             window,
         };
+        mem_log("after resumed (renderer + egui ready)");
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -945,6 +980,16 @@ impl ApplicationHandler<AppEvent> for App {
                 surface_texture.present();
                 let _ = device_handle.device.poll(wgpu::PollType::Poll);
 
+                #[cfg(feature = "dhat")]
+                {
+                    static FRAME: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if matches!(n, 0 | 5 | 30 | 120) {
+                        mem_log(&format!("after frame {}", n + 1));
+                    }
+                }
+
                 if full_output.viewport_output.values().any(|v| v.repaint_delay.is_zero()) {
                     window.request_redraw();
                 }
@@ -956,7 +1001,11 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "dhat")]
+    let _profiler = dhat::Profiler::new_heap();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    mem_log("main start");
 
     let path = std::env::args()
         .nth(1)
