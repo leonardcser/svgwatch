@@ -44,6 +44,75 @@ fn mem_log(label: &str) {
 #[cfg(not(feature = "dhat"))]
 fn mem_log(_label: &str) {}
 
+#[cfg(feature = "dhat")]
+struct FrameStats {
+    frame_count: u32,
+    window_start: Option<Instant>,
+    total: std::time::Duration,
+    rebuild: std::time::Duration,
+    egui_cpu: std::time::Duration,
+    surface_acquire: std::time::Duration,
+    vello_render: std::time::Duration,
+    egui_gpu: std::time::Duration,
+    submit_present: std::time::Duration,
+}
+
+#[cfg(feature = "dhat")]
+impl FrameStats {
+    const fn new() -> Self {
+        Self {
+            frame_count: 0,
+            window_start: None,
+            total: std::time::Duration::ZERO,
+            rebuild: std::time::Duration::ZERO,
+            egui_cpu: std::time::Duration::ZERO,
+            surface_acquire: std::time::Duration::ZERO,
+            vello_render: std::time::Duration::ZERO,
+            egui_gpu: std::time::Duration::ZERO,
+            submit_present: std::time::Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, phases: [std::time::Duration; 7]) {
+        if self.window_start.is_none() {
+            self.window_start = Some(Instant::now());
+        }
+        self.frame_count += 1;
+        self.total += phases[0];
+        self.rebuild += phases[1];
+        self.egui_cpu += phases[2];
+        self.surface_acquire += phases[3];
+        self.vello_render += phases[4];
+        self.egui_gpu += phases[5];
+        self.submit_present += phases[6];
+        if self.frame_count >= 60 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let n = self.frame_count as f64;
+        let elapsed = self.window_start.unwrap().elapsed().as_secs_f64();
+        let fps = n / elapsed;
+        let avg_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n;
+        eprintln!(
+            "frame: fps={:5.1}  total={:5.2}ms  rebuild={:5.2}  egui_cpu={:5.2}  acquire={:5.2}  vello={:5.2}  egui_gpu={:5.2}  present={:5.2}",
+            fps,
+            avg_ms(self.total),
+            avg_ms(self.rebuild),
+            avg_ms(self.egui_cpu),
+            avg_ms(self.surface_acquire),
+            avg_ms(self.vello_render),
+            avg_ms(self.egui_gpu),
+            avg_ms(self.submit_present),
+        );
+        *self = Self::new();
+    }
+}
+
+#[cfg(feature = "dhat")]
+static FRAME_STATS: std::sync::Mutex<FrameStats> = std::sync::Mutex::new(FrameStats::new());
+
 const ZOOM_PER_LINE: f64 = 1.15;
 const ZOOM_PER_PIXEL: f64 = 0.0015;
 const PAN_STEP: f64 = 40.0;
@@ -69,6 +138,10 @@ struct App {
     renderers: Vec<Option<Renderer>>,
     state: RenderState,
     scene: Scene,
+    /// Cleared and rebuilt from `fragment` + `transform` + search highlight only
+    /// when something visible has changed; redraws driven purely by egui
+    /// animations reuse the cached scene.
+    scene_dirty: bool,
     fragment: Scene,
     svg_path: PathBuf,
     svg_size: Vec2,
@@ -163,6 +236,7 @@ impl App {
             renderers: vec![],
             state: RenderState::Suspended(None),
             scene: Scene::new(),
+            scene_dirty: true,
             fragment: Scene::new(),
             svg_path,
             svg_size: Vec2::new(1.0, 1.0),
@@ -246,6 +320,7 @@ impl App {
         // Always rebuild matches so a non-empty query reflects the new file
         // even if the search bar is currently closed.
         self.recompute_matches();
+        self.scene_dirty = true;
         Ok(())
     }
 
@@ -282,6 +357,7 @@ impl App {
     fn open_search(&mut self) {
         self.search_active = true;
         self.want_focus_search = true;
+        self.scene_dirty = true;
         if !self.search_query.is_empty() {
             self.recompute_matches();
         }
@@ -291,12 +367,14 @@ impl App {
         self.search_active = false;
         self.matches.clear();
         self.current_match = None;
+        self.scene_dirty = true;
     }
 
     fn recompute_matches(&mut self) {
         self.matches.clear();
         if self.search_query.is_empty() {
             self.current_match = None;
+            self.scene_dirty = true;
             return;
         }
         let q = self.search_query.to_lowercase();
@@ -306,12 +384,14 @@ impl App {
             }
         }
         self.current_match = if self.matches.is_empty() { None } else { Some(0) };
+        self.scene_dirty = true;
     }
 
     fn next_match(&mut self) {
         if let Some(i) = self.current_match {
             if !self.matches.is_empty() {
                 self.current_match = Some((i + 1) % self.matches.len());
+                self.scene_dirty = true;
             }
         }
     }
@@ -320,6 +400,7 @@ impl App {
         if let Some(i) = self.current_match {
             if !self.matches.is_empty() {
                 self.current_match = Some((i + self.matches.len() - 1) % self.matches.len());
+                self.scene_dirty = true;
             }
         }
     }
@@ -347,6 +428,7 @@ impl App {
         let tx = viewport_w as f64 * 0.5 - cx * scale;
         let ty = viewport_h as f64 * 0.5 - cy * scale;
         self.transform = Affine::translate((tx, ty)) * Affine::scale(scale);
+        self.scene_dirty = true;
     }
 
     fn current_match_bounds(&self) -> Option<Rect> {
@@ -500,6 +582,7 @@ impl App {
         let tx = (w as f64 - self.svg_size.x * s) / 2.0;
         let ty = (h as f64 - self.svg_size.y * s) / 2.0;
         self.transform = Affine::translate((tx, ty)) * Affine::scale(s);
+        self.scene_dirty = true;
     }
 
     fn current_scale(&self) -> f64 {
@@ -520,10 +603,12 @@ impl App {
             * Affine::scale(factor)
             * Affine::translate((-p.0, -p.1))
             * self.transform;
+        self.scene_dirty = true;
     }
 
     fn pan(&mut self, dx: f64, dy: f64) {
         self.transform = Affine::translate((dx, dy)) * self.transform;
+        self.scene_dirty = true;
     }
 
     fn request_redraw(&self) {
@@ -650,10 +735,13 @@ impl ApplicationHandler<AppEvent> for App {
         // Route the event through egui first; if a focused widget consumed
         // it (e.g. the search field is taking keystrokes), don't run our
         // own handlers below.
+        // Honor egui's repaint hint only while the search bar is on screen
+        // — otherwise every mouse move would burn ~60 fps of CPU rebuilding
+        // the Vello scene for nothing.
         let mut consumed_by_egui = false;
         if let Some(state) = self.egui_state.as_mut() {
             let resp = state.on_window_event(&window, &event);
-            if resp.repaint {
+            if resp.repaint && self.search_active {
                 window.request_redraw();
             }
             consumed_by_egui = resp.consumed;
@@ -805,36 +893,49 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // 1. Build the vello scene: SVG + match highlight overlay.
-                self.scene.reset();
-                self.scene.append(&self.fragment, Some(self.transform));
+                #[cfg(feature = "dhat")]
+                let t_frame = Instant::now();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
 
-                if self.search_active {
-                    if let Some(b) = self.current_match_bounds() {
-                        let pad = 2.0;
-                        let rect = RoundedRect::new(
-                            b.x0 - pad,
-                            b.y0 - pad,
-                            b.x1 + pad,
-                            b.y1 + pad,
-                            3.0,
-                        );
-                        self.scene.fill(
-                            Fill::NonZero,
-                            self.transform,
-                            Color::from_rgba8(255, 200, 0, 70),
-                            None,
-                            &rect,
-                        );
-                        self.scene.stroke(
-                            &Stroke::new(2.0 / self.current_scale().max(1e-6)),
-                            self.transform,
-                            Color::from_rgba8(255, 140, 0, 230),
-                            None,
-                            &rect,
-                        );
+                // 1. Rebuild the vello scene only when something visible changed.
+                // Egui-driven redraws (cursor blink, hover) reuse the cached scene.
+                if self.scene_dirty {
+                    self.scene.reset();
+                    self.scene.append(&self.fragment, Some(self.transform));
+
+                    if self.search_active {
+                        if let Some(b) = self.current_match_bounds() {
+                            let pad = 2.0;
+                            let rect = RoundedRect::new(
+                                b.x0 - pad,
+                                b.y0 - pad,
+                                b.x1 + pad,
+                                b.y1 + pad,
+                                3.0,
+                            );
+                            self.scene.fill(
+                                Fill::NonZero,
+                                self.transform,
+                                Color::from_rgba8(255, 200, 0, 70),
+                                None,
+                                &rect,
+                            );
+                            self.scene.stroke(
+                                &Stroke::new(2.0 / self.current_scale().max(1e-6)),
+                                self.transform,
+                                Color::from_rgba8(255, 140, 0, 230),
+                                None,
+                                &rect,
+                            );
+                        }
                     }
+                    self.scene_dirty = false;
                 }
+                #[cfg(feature = "dhat")]
+                let d_rebuild = t_phase.elapsed();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
 
                 // 2. Run egui to build the search bar UI for this frame.
                 let raw_input = self
@@ -877,6 +978,11 @@ impl ApplicationHandler<AppEvent> for App {
                     .egui_ctx
                     .tessellate(full_output.shapes, pixels_per_point);
 
+                #[cfg(feature = "dhat")]
+                let d_egui_cpu = t_phase.elapsed();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
+
                 // 3. Render vello → surface, then egui → surface (on top).
                 let (width, height) = match &self.state {
                     RenderState::Active { surface, .. } => {
@@ -899,6 +1005,11 @@ impl ApplicationHandler<AppEvent> for App {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
+                #[cfg(feature = "dhat")]
+                let d_acquire = t_phase.elapsed();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
+
                 self.renderers[dev_id]
                     .as_mut()
                     .unwrap()
@@ -915,6 +1026,11 @@ impl ApplicationHandler<AppEvent> for App {
                         },
                     )
                     .expect("render");
+
+                #[cfg(feature = "dhat")]
+                let d_vello = t_phase.elapsed();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
 
                 let mut encoder = device_handle.device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor {
@@ -970,6 +1086,11 @@ impl ApplicationHandler<AppEvent> for App {
                     renderer.render(&mut rpass, &paint_jobs, &screen_descriptor);
                 }
 
+                #[cfg(feature = "dhat")]
+                let d_egui_gpu = t_phase.elapsed();
+                #[cfg(feature = "dhat")]
+                let t_phase = Instant::now();
+
                 let mut all_cbufs = user_cbufs;
                 all_cbufs.push(encoder.finish());
                 device_handle.queue.submit(all_cbufs);
@@ -982,6 +1103,18 @@ impl ApplicationHandler<AppEvent> for App {
 
                 #[cfg(feature = "dhat")]
                 {
+                    let d_present = t_phase.elapsed();
+                    let d_total = t_frame.elapsed();
+                    FRAME_STATS.lock().unwrap().record([
+                        d_total,
+                        d_rebuild,
+                        d_egui_cpu,
+                        d_acquire,
+                        d_vello,
+                        d_egui_gpu,
+                        d_present,
+                    ]);
+
                     static FRAME: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
